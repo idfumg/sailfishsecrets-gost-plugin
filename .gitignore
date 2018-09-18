@@ -1,0 +1,6 @@
+documentation.list
+RPMS
+Makefile
+*.so
+*.o
+moc_*

@@ -1,0 +1,1 @@
+# sailfishsecrets-gost-plugin

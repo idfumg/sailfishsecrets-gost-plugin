@@ -17,6 +17,16 @@ namespace Plugins {
 
     namespace {
 
+        enum class GenerateKeyType {
+            SymmetricKey = 0,
+            AsymmetricKeyPair = 1
+        };
+
+        enum class GenerateKeyParams {
+            WithPbkdfParams = 0,
+            WithoutPbkdfParams = 1,
+        };
+
         Result GenerateRandomData(
             const QString &csprngEngineName,
             const quint64 nbytes,
@@ -52,11 +62,13 @@ namespace Plugins {
             const Key &keyTemplate,
             Key *key)
         {
+            constexpr auto privateKeyLength = OPENSSL_HELPER_GOST_SIGNATURE_KEY_SIZE;
+
             QByteArray randomKey;
 
             const auto randomResult = GenerateRandomData(
                 QStringLiteral("/dev/urandom"),
-                keyTemplate.size() / 8,
+                privateKeyLength,
                 &randomKey);
 
             if (randomResult.code() != Result::Succeeded) {
@@ -65,7 +77,7 @@ namespace Plugins {
 
             *key = keyTemplate;
             key->setSecretKey(randomKey);
-            key->setSize(keyTemplate.size());
+            key->setSize(privateKeyLength);
 
             return Result(Result::Succeeded);
         }
@@ -75,33 +87,167 @@ namespace Plugins {
             const KeyDerivationParameters &skdfParams,
             Key *key)
         {
-            const int nbytes = skdfParams.outputKeySize() / 8;
-            QScopedArrayPointer<char> buf(new char[nbytes]);
+            // use key derivation to derive a key from input data.
+            if (skdfParams.keyDerivationFunction() != CryptoManager::KdfPkcs5Pbkdf2) {
+                return Result(
+                    Result::OperationNotSupportedError,
+                    QLatin1String("Gost unsupported key derivation function specified"));
+            }
+
+            if (skdfParams.keyDerivationMac() != CryptoManager::MacHmac) {
+                return Result(
+                    Result::OperationNotSupportedError,
+                    QLatin1String("Gost unsupported key derivation message authentication code specified"));
+            }
+
+            if (skdfParams.keyDerivationDigestFunction() != CryptoManager::DigestGost_2012_256) {
+                return Result(
+                    Result::OperationNotSupportedError,
+                    QLatin1String("Gost unsupported key derivation digest function specified"));
+            }
+
+            if (skdfParams.iterations() < 0 || skdfParams.iterations() > 32768) {
+                return Result(
+                    Result::OperationNotSupportedError,
+                    QLatin1String("Gost unsupported iterations specified"));
+            }
+
+            constexpr auto privateKeyLength = OPENSSL_HELPER_GOST_SIGNATURE_KEY_SIZE;
+            QScopedArrayPointer<char> buf(new char[privateKeyLength]);
 
             const int rc = openssl_helper_pbkdf2_256_out(
                 skdfParams.inputData().constData(),
                 skdfParams.inputData().size(),
 
                 skdfParams.salt().isEmpty()
-                ? Q_NULLPTR
-                : reinterpret_cast<const unsigned char*>(skdfParams.salt().constData()),
+                    ? Q_NULLPTR
+                    : reinterpret_cast<const unsigned char*>(skdfParams.salt().constData()),
                 skdfParams.salt().size(),
 
                 skdfParams.iterations(),
 
                 reinterpret_cast<unsigned char*>(buf.data()),
-                nbytes);
+                privateKeyLength);
 
             if (rc < 0) {
                 return Result(
                     Result::CryptoPluginKeyGenerationError,
-                    QLatin1String("Gost crypto plugin failed to derive the key data: ") +
+                    QLatin1String("Gost crypto plugin failed to derive the private key data: ") +
                     QLatin1String(openssl_helper_errstr));
             }
 
             *key = keyTemplate;
-            key->setSecretKey(QByteArray(buf.data(), nbytes));
-            key->setSize(skdfParams.outputKeySize());
+            key->setSecretKey(QByteArray(buf.data(), privateKeyLength));
+            key->setSize(privateKeyLength);
+
+            return Result(Result::Succeeded);
+        }
+
+        Result GenerateKeyPrivate(
+            const Key &keyTemplate,
+            const KeyDerivationParameters& skdfParams,
+            const GenerateKeyParams& generateKeyParams,
+            Key *key)
+        {
+            switch (generateKeyParams) {
+            case GenerateKeyParams::WithoutPbkdfParams: {
+                return GenerateKeyWithoutPbkdf(keyTemplate, key);
+            }
+            case GenerateKeyParams::WithPbkdfParams: {
+                return GenerateKeyWithPbkdf(keyTemplate, skdfParams, key);
+            }
+            } // switch
+
+            return Result(Result::Succeeded);
+        }
+
+        Result GenerateKeyPublic(
+            const Key& privateKey,
+            const KeyPairGenerationParameters& kpgParams,
+            const GenerateKeyType& generateKeyType,
+            Key *publicKey)
+        {
+            Q_UNUSED(kpgParams);
+
+            constexpr auto publicKeySize = OPENSSL_HELPER_GOST_SIGNATURE_PUBLIC_KEY_SIZE;
+            constexpr auto privateKeySize = OPENSSL_HELPER_GOST_SIGNATURE_KEY_SIZE;
+
+            qDebug() << "publicKeySize = " << publicKeySize;
+
+            if (privateKey.size() != privateKeySize) {
+                const auto msg =
+                    QStringLiteral("Gost plugin size of private key must be %1, yours %2")
+                    .arg(privateKeySize * 8 /*bits*/).arg(privateKey.size());
+                return Result(
+                    Result::CryptoPluginKeyGenerationError,
+                    msg);
+            }
+
+            switch (generateKeyType) {
+            case GenerateKeyType::SymmetricKey: {
+                break;
+            }
+            case GenerateKeyType::AsymmetricKeyPair: {
+                QScopedArrayPointer<char> buf(new char[publicKeySize]);
+
+                const int rc = openssl_helper_compute_public_256_out(
+                    privateKey.secretKey(),
+                    privateKey.secretKey().size(),
+
+                    reinterpret_cast<unsigned char*>(buf.data()),
+                    publicKeySize);
+
+                if (rc < 0) {
+                    return Result(
+                        Result::CryptoPluginKeyGenerationError,
+                        QLatin1String("Gost crypto plugin failed to create public key: ") +
+                        QLatin1String(openssl_helper_errstr));
+                }
+
+                *publicKey = privateKey;
+                publicKey->setSecretKey(QByteArray(buf.data(), publicKeySize));
+                publicKey->setSize(publicKeySize);
+            }
+            } // switch
+
+            return Result(Result::Succeeded);
+        }
+
+        Result GenerateKey(
+            const Key& keyTemplate,
+            const KeyPairGenerationParameters& kpgParams,
+            const KeyDerivationParameters& skdfParams,
+            const GenerateKeyType& generateKeyType,
+            const GenerateKeyParams& generateKeyParams,
+            Key *key)
+        {
+            *key = keyTemplate;
+
+            Key privateKey;
+            const auto resultPrivate =
+                GenerateKeyPrivate(keyTemplate, skdfParams, generateKeyParams, &privateKey);
+
+            if (resultPrivate != Result(Result::Succeeded)) {
+                return resultPrivate;
+            }
+
+            if (generateKeyType == GenerateKeyType::SymmetricKey) {
+                key->setSecretKey(privateKey.secretKey());
+                key->setSize(privateKey.size());
+                return Result(Result::Succeeded);
+            }
+
+            Key publicKey;
+            const auto resultPublic =
+                GenerateKeyPublic(privateKey, kpgParams, generateKeyType, &publicKey);
+
+            if (resultPublic != Result(Result::Succeeded)) {
+                return resultPublic;
+            }
+
+            key->setPrivateKey(privateKey.secretKey());
+            key->setPublicKey(publicKey.secretKey());
+            key->setSize(privateKey.size());
 
             return Result(Result::Succeeded);
         }
@@ -188,6 +334,91 @@ namespace Plugins {
             return Result(Result::Succeeded);
         }
 
+        Result CalculateDigest(
+            const QByteArray& data,
+            QByteArray& digest)
+        {
+            constexpr auto digestSize = OPENSSL_HELPER_GOST_DIGEST_SIZE;
+
+            QScopedPointer<char> digestBytes(new char[digestSize]);
+
+            const int rc = openssl_helper_digest_256_out(
+                data.data(),
+                data.size(),
+                digestBytes.data(),
+                digestSize);
+
+            if (rc < 0) {
+                return Result(
+                    Result::CryptoPluginDigestError,
+                    QLatin1String("Gost error when call digest function: ") +
+                    QLatin1String(openssl_helper_errstr));
+            }
+
+            digest = QByteArray(digestBytes.data(), digestSize);
+
+            return Result(Result::Succeeded);
+        }
+
+        Result CalculateSignature(
+            const QByteArray& privateKey,
+            const QByteArray& data,
+            QByteArray& signature)
+        {
+            constexpr auto signatureSize = OPENSSL_HELPER_GOST_SIGNATURE_SIZE;
+
+            qDebug() << "signatureSize = " << signatureSize;
+
+            QScopedPointer<char> signatureBytes(new char[signatureSize]);
+
+            const int rc = openssl_helper_sign_256_out(
+                privateKey.data(),
+                privateKey.size(),
+
+                data.data(),
+                data.size(),
+
+                signatureBytes.data(),
+                signatureSize);
+
+            if (rc < 0) {
+                return Result(
+                    Result::CryptoPluginSigningError,
+                    QLatin1String("Gost error when sign data: ") +
+                    QLatin1String(openssl_helper_errstr));
+            }
+
+            signature = QByteArray(signatureBytes.data(), signatureSize);
+
+            return Result(Result::Succeeded);
+        }
+
+        Result VerifySignature(
+            const QByteArray& ,
+            const QByteArray& data,
+            const QByteArray& signature)
+        {
+            const QByteArray wrongKey('a', OPENSSL_HELPER_GOST_SIGNATURE_PUBLIC_KEY_SIZE);
+            const int rc = openssl_helper_verify_256(
+                wrongKey.data(),
+                wrongKey.size(),
+
+                data.data(),
+                data.size(),
+
+                signature.data(),
+                signature.size());
+
+            if (rc < 0) {
+                return Result(
+                    Result::CryptoPluginVerificationError,
+                    QLatin1String("Gost error when verify signature: ") +
+                    QLatin1String(openssl_helper_errstr));
+            }
+
+            return Result(Result::Succeeded);
+        }
+
     } // anonymous namespace
 
     GostCryptoPlugin::GostCryptoPlugin(QObject* parent)
@@ -201,7 +432,7 @@ namespace Plugins {
 
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::generateRandomData(
+    Result GostCryptoPlugin::generateRandomData(
         quint64 callerIdent,
         const QString &csprngEngineName,
         quint64 numberBytes,
@@ -214,7 +445,7 @@ namespace Plugins {
         return GenerateRandomData(csprngEngineName, numberBytes, randomData);
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::seedRandomDataGenerator(
+    Result GostCryptoPlugin::seedRandomDataGenerator(
         quint64 callerIdent,
         const QString &csprngEngineName,
         const QByteArray &seedData,
@@ -233,24 +464,24 @@ namespace Plugins {
         return Result(Result::Succeeded);
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::generateInitializationVector(
-        Sailfish::Crypto::CryptoManager::Algorithm algorithm,
-        Sailfish::Crypto::CryptoManager::BlockMode blockMode,
+    Result GostCryptoPlugin::generateInitializationVector(
+        CryptoManager::Algorithm algorithm,
+        CryptoManager::BlockMode blockMode,
         int keySize,
         const QVariantMap &customParameters,
         QByteArray *generatedIV)
     {
         Q_UNUSED(customParameters);
 
-        if (algorithm != Sailfish::Crypto::CryptoManager::AlgorithmGost) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::OperationNotSupportedError,
+        if (algorithm != CryptoManager::AlgorithmGost) {
+            return Result(
+                Result::OperationNotSupportedError,
                 QLatin1String("Gost: iv: cannot use algorithms other than Gost"));
         }
 
-        if (blockMode != Sailfish::Crypto::CryptoManager::BlockModeOfb) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::OperationNotSupportedError,
+        if (blockMode != CryptoManager::BlockModeOfb) {
+            return Result(
+                Result::OperationNotSupportedError,
                 QLatin1String("Gost: iv: cannot encrypt with block mode other than OFB"));
         }
 
@@ -264,11 +495,10 @@ namespace Plugins {
         const QVariantMap &customParameters,
         Key *key)
     {
-        Q_UNUSED(kpgParams);
         Q_UNUSED(customParameters);
 
         if (keyTemplate.size() < OPENSSL_HELPER_KUZNYECHIK_KEY_SIZE or
-            (keyTemplate.size() % 8) != 0)
+            (keyTemplate.size() % 8 /*padded to 1 byte*/) != 0)
         {
             return Result(
                 Result::OperationNotSupportedError,
@@ -281,44 +511,23 @@ namespace Plugins {
                 QLatin1String("Gost plugin cannot use algorithms other than Gost"));
         }
 
-        if (not skdfParams.isValid()) {
-            return GenerateKeyWithoutPbkdf(keyTemplate, key);
-        }
+        const GenerateKeyType keyType = kpgParams.isValid()
+            ? GenerateKeyType::AsymmetricKeyPair
+            : GenerateKeyType::SymmetricKey;
 
-        // use key derivation to derive a key from input data.
-        if (skdfParams.keyDerivationFunction() != CryptoManager::KdfPkcs5Pbkdf2) {
-            return Result(
-                Result::OperationNotSupportedError,
-                QLatin1String("Gost unsupported key derivation function specified"));
-        }
+        const GenerateKeyParams keyParams = skdfParams.isValid()
+            ? GenerateKeyParams::WithPbkdfParams
+            : GenerateKeyParams::WithoutPbkdfParams;
 
-        if (skdfParams.keyDerivationMac() != CryptoManager::MacHmac) {
-            return Result(
-                Result::OperationNotSupportedError,
-                QLatin1String("Gost unsupported key derivation message authentication code specified"));
-        }
-
-        if (skdfParams.keyDerivationDigestFunction() != CryptoManager::DigestGost_2012_256) {
-            return Result(
-                Result::OperationNotSupportedError,
-                QLatin1String("Gost unsupported key derivation digest function specified"));
-        }
-
-        if (skdfParams.iterations() < 0 || skdfParams.iterations() > 32768) {
-            return Result(
-                Result::OperationNotSupportedError,
-                QLatin1String("Gost unsupported iterations specified"));
-        }
-
-        return GenerateKeyWithPbkdf(keyTemplate, skdfParams, key);
+        return GenerateKey(keyTemplate, kpgParams, skdfParams, keyType, keyParams, key);
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::generateAndStoreKey(
-        const Sailfish::Crypto::Key &keyTemplate,
-        const Sailfish::Crypto::KeyPairGenerationParameters &kpgParams,
-        const Sailfish::Crypto::KeyDerivationParameters &skdfParams,
+    Result GostCryptoPlugin::generateAndStoreKey(
+        const Key &keyTemplate,
+        const KeyPairGenerationParameters &kpgParams,
+        const KeyDerivationParameters &skdfParams,
         const QVariantMap &customParameters,
-        Sailfish::Crypto::Key *keyMetadata)
+        Key *keyMetadata)
     {
         Q_UNUSED(keyTemplate);
         Q_UNUSED(kpgParams);
@@ -329,11 +538,11 @@ namespace Plugins {
                       QLatin1String("Gost crypto plugin doesn't support generateAndStoreKey"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::importKey(
+    Result GostCryptoPlugin::importKey(
         const QByteArray &data,
         const QByteArray &passphrase,
         const QVariantMap &customParameters,
-        Sailfish::Crypto::Key *importedKey)
+        Key *importedKey)
     {
         Q_UNUSED(data);
         Q_UNUSED(passphrase);
@@ -343,12 +552,12 @@ namespace Plugins {
                       QLatin1String("The OpenSSL crypto plugin doesn't support importKey"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::importAndStoreKey(
+    Result GostCryptoPlugin::importAndStoreKey(
         const QByteArray &data,
-        const Sailfish::Crypto::Key &keyTemplate,
+        const Key &keyTemplate,
         const QByteArray &passphrase,
         const QVariantMap &customParameters,
-        Sailfish::Crypto::Key *keyMetadata)
+        Key *keyMetadata)
     {
         Q_UNUSED(data);
         Q_UNUSED(keyTemplate);
@@ -359,11 +568,11 @@ namespace Plugins {
                       QLatin1String("The OpenSSL crypto plugin doesn't support importAndStoreKey"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::storedKey(
-        const Sailfish::Crypto::Key::Identifier &identifier,
-        Sailfish::Crypto::Key::Components keyComponents,
+    Result GostCryptoPlugin::storedKey(
+        const Key::Identifier &identifier,
+        Key::Components keyComponents,
         const QVariantMap &customParameters,
-        Sailfish::Crypto::Key *key)
+        Key *key)
     {
         Q_UNUSED(identifier);
         Q_UNUSED(keyComponents);
@@ -373,10 +582,10 @@ namespace Plugins {
                       QLatin1String("The OpenSSL crypto plugin doesn't support storedKey"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::storedKeyIdentifiers(
+    Result GostCryptoPlugin::storedKeyIdentifiers(
         const QString &collectionName,
         const QVariantMap &customParameters,
-        QVector<Sailfish::Crypto::Key::Identifier> *identifiers)
+        QVector<Key::Identifier> *identifiers)
     {
         Q_UNUSED(collectionName);
         Q_UNUSED(customParameters);
@@ -407,81 +616,138 @@ namespace Plugins {
         }
 
         if (padding != CryptoManager::SignaturePaddingNone) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::OperationNotSupportedError,
+            return Result(
+                Result::OperationNotSupportedError,
                 QLatin1String("Gost cannot digest padding other than None"));
         }
 
         if (digestFunction != CryptoManager::DigestGost_2012_256) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::OperationNotSupportedError,
+            return Result(
+                Result::OperationNotSupportedError,
                 QLatin1String("Gost cannot has digest other than DigestGost_2012_256"));
         }
 
-        QScopedPointer<char> digestBytes(new char[OPENSSL_HELPER_GOST_DIGEST_SIZE]);
-
-        const int rc = openssl_helper_digest_256_out(
-            data.data(),
-            data.size(),
-            digestBytes.data(),
-            OPENSSL_HELPER_GOST_DIGEST_SIZE);
-
-        if (rc < 0) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::CryptoPluginDigestError,
-                QLatin1String("Gost error when call digest function: ") +
-                QLatin1String(openssl_helper_errstr));
-        }
-
-        *digest = QByteArray(digestBytes.data(), OPENSSL_HELPER_GOST_DIGEST_SIZE);
-
-        return Sailfish::Crypto::Result(Sailfish::Crypto::Result::Succeeded);
+        return CalculateDigest(data, *digest);
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::sign(
+    Result GostCryptoPlugin::sign(
         const QByteArray &data,
-        const Sailfish::Crypto::Key &key,
-        Sailfish::Crypto::CryptoManager::SignaturePadding padding,
-        Sailfish::Crypto::CryptoManager::DigestFunction digestFunction,
+        const Key &key,
+        CryptoManager::SignaturePadding padding,
+        CryptoManager::DigestFunction digestFunction,
         const QVariantMap &customParameters,
         QByteArray *signature)
     {
-        Q_UNUSED(data);
-        Q_UNUSED(key);
-        Q_UNUSED(padding);
-        Q_UNUSED(digestFunction);
         Q_UNUSED(customParameters);
-        Q_UNUSED(signature);
-        return Result(Result::OperationNotSupportedError,
-                      QLatin1String("The OpenSSL crypto plugin doesn't support sign"));
+
+        if (data.isEmpty()) {
+            return Result(
+                Result::EmptyDataError,
+                QLatin1String("Gost cannot sign data if there is no data"));
+        }
+
+        if (key.privateKey().isEmpty()) {
+            return Result(
+                Result::EmptyDataError,
+                QLatin1String("Gost cannot sign data without private key"));
+        }
+
+        if (padding != CryptoManager::SignaturePaddingNone) {
+            return Result(
+                Result::OperationNotSupportedError,
+                QLatin1String("Gost cannot sign padding other than None"));
+        }
+
+        if (digestFunction != CryptoManager::DigestGost_2012_256) {
+            return Result(
+                Result::OperationNotSupportedError,
+                QLatin1String("Gost cannot has digest other than DigestGost_2012_256"));
+        }
+
+        QByteArray digest;
+        const auto digestResult = CalculateDigest(data, digest);
+
+        if (digestResult != Result(Result::Succeeded)) {
+            return digestResult;
+        }
+
+        if (digest.isEmpty()) {
+            return Result(
+                Result::OperationNotSupportedError,
+                QLatin1String("Gost error! Calculated digest is empty"));
+        }
+
+        qDebug() << "digest.size() = " << digest.size();
+        qDebug() << "digest = " << digest;
+
+        return CalculateSignature(key.privateKey(), digest, *signature);
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::verify(
+    Result GostCryptoPlugin::verify(
         const QByteArray &signature,
         const QByteArray &data,
-        const Sailfish::Crypto::Key &key,
-        Sailfish::Crypto::CryptoManager::SignaturePadding padding,
-        Sailfish::Crypto::CryptoManager::DigestFunction digestFunction,
+        const Key &key,
+        CryptoManager::SignaturePadding padding,
+        CryptoManager::DigestFunction digestFunction,
         const QVariantMap &customParameters,
-        Sailfish::Crypto::CryptoManager::VerificationStatus *verificationStatus)
+        CryptoManager::VerificationStatus *verificationStatus)
     {
-        Q_UNUSED(signature);
-        Q_UNUSED(data);
-        Q_UNUSED(key);
-        Q_UNUSED(padding);
-        Q_UNUSED(digestFunction);
         Q_UNUSED(customParameters);
-        Q_UNUSED(verificationStatus);
-        return Result(Result::OperationNotSupportedError,
-                      QLatin1String("The OpenSSL crypto plugin doesn't support verify"));
+
+        if (data.isEmpty()) {
+            return Result(
+                Result::EmptyDataError,
+                QLatin1String("Gost cannot verify data if there is no data"));
+        }
+
+        if (key.publicKey().isEmpty()) {
+            return Result(
+                Result::EmptyDataError,
+                QLatin1String("Gost cannot verify data without public key"));
+        }
+
+        if (padding != CryptoManager::SignaturePaddingNone) {
+            return Result(
+                Result::OperationNotSupportedError,
+                QLatin1String("Gost cannot verify padding other than None"));
+        }
+
+        if (digestFunction != CryptoManager::DigestGost_2012_256) {
+            return Result(
+                Result::OperationNotSupportedError,
+                QLatin1String("Gost cannot has digest other than DigestGost_2012_256"));
+        }
+
+        QByteArray digest;
+        const auto digestResult =
+            CalculateDigest(data, digest);
+
+        if (digestResult != Result(Result::Succeeded)) {
+            return digestResult;
+        }
+
+        if (digest.isEmpty()) {
+            return Result(
+                Result::OperationNotSupportedError,
+                QLatin1String("Gost error! Calculated digest is empty"));
+        }
+
+        const Result result =
+            VerifySignature(key.publicKey(), digest, signature);
+
+        *verificationStatus = result == Result(Result::Succeeded)
+            ? CryptoManager::VerificationSucceeded
+            : CryptoManager::VerificationFailed;
+
+        return result;
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::encrypt(
+    Result GostCryptoPlugin::encrypt(
         const QByteArray &data,
         const QByteArray &iv,
-        const Sailfish::Crypto::Key &key,
-        Sailfish::Crypto::CryptoManager::BlockMode blockMode,
-        Sailfish::Crypto::CryptoManager::EncryptionPadding padding,
+        const Key &key,
+        CryptoManager::BlockMode blockMode,
+        CryptoManager::EncryptionPadding padding,
         const QByteArray &authenticationData,
         const QVariantMap &customParameters,
         QByteArray *encrypted,
@@ -490,38 +756,38 @@ namespace Plugins {
         Q_UNUSED(customParameters);
 
         if (encrypted == nullptr) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::CryptoPluginEncryptionError,
+            return Result(
+                Result::CryptoPluginEncryptionError,
                 QLatin1String("Gost the 'encrypted' argument SHOULD NOT be nullptr."));
         }
 
-        if (key.algorithm() != Sailfish::Crypto::CryptoManager::AlgorithmGost) {
-            return Sailfish::Crypto::Result(
+        if (key.algorithm() != CryptoManager::AlgorithmGost) {
+            return Result(
                 Result::OperationNotSupportedError,
                 QLatin1String("Gost crypto plugin supports only Gost encrypt algorithm"));
         }
 
         if (key.secretKey().isEmpty()) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::EmptySecretKeyError,
+            return Result(
+                Result::EmptySecretKeyError,
                 QLatin1String("Gost cannot encrypt with empty secret key"));
         }
 
         if (iv.isEmpty()) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::EmptySecretKeyError,
+            return Result(
+                Result::EmptySecretKeyError,
                 QLatin1String("Gost cannot encrypt with empty iv"));
         }
 
-        if (blockMode != Sailfish::Crypto::CryptoManager::BlockModeOfb) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::OperationNotSupportedError,
+        if (blockMode != CryptoManager::BlockModeOfb) {
+            return Result(
+                Result::OperationNotSupportedError,
                 QLatin1String("Gost cannot encrypt with block mode other than OFB"));
         }
 
-        if (padding != Sailfish::Crypto::CryptoManager::EncryptionPaddingNone) {
-            return Sailfish::Crypto::Result(
-                Sailfish::Crypto::Result::OperationNotSupportedError,
+        if (padding != CryptoManager::EncryptionPaddingNone) {
+            return Result(
+                Result::OperationNotSupportedError,
                 QLatin1String("Gost cannot encrypt with padding other than None"));
         }
 
@@ -619,15 +885,15 @@ namespace Plugins {
             decrypted);
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::initializeCipherSession(
+    Result GostCryptoPlugin::initializeCipherSession(
         quint64 clientId,
         const QByteArray &iv,
-        const Sailfish::Crypto::Key &key, // or keyreference, i.e. Key(keyName)
-        Sailfish::Crypto::CryptoManager::Operation operation,
-        Sailfish::Crypto::CryptoManager::BlockMode blockMode,
-        Sailfish::Crypto::CryptoManager::EncryptionPadding encryptionPadding,
-        Sailfish::Crypto::CryptoManager::SignaturePadding signaturePadding,
-        Sailfish::Crypto::CryptoManager::DigestFunction digestFunction,
+        const Key &key, // or keyreference, i.e. Key(keyName)
+        CryptoManager::Operation operation,
+        CryptoManager::BlockMode blockMode,
+        CryptoManager::EncryptionPadding encryptionPadding,
+        CryptoManager::SignaturePadding signaturePadding,
+        CryptoManager::DigestFunction digestFunction,
         const QVariantMap &customParameters,
         quint32 *cipherSessionToken)
     {
@@ -645,7 +911,7 @@ namespace Plugins {
                       QLatin1String("The OpenSSL crypto plugin doesn't support initializeCipherSession"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::updateCipherSessionAuthentication(
+    Result GostCryptoPlugin::updateCipherSessionAuthentication(
         quint64 clientId,
         const QByteArray &authenticationData,
         const QVariantMap &customParameters,
@@ -659,7 +925,7 @@ namespace Plugins {
                       QLatin1String("The OpenSSL crypto plugin doesn't support updateCipherSessionAuthentication"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::updateCipherSession(
+    Result GostCryptoPlugin::updateCipherSession(
         quint64 clientId,
         const QByteArray &data,
         const QVariantMap &customParameters,
@@ -675,13 +941,13 @@ namespace Plugins {
                       QLatin1String("The OpenSSL crypto plugin doesn't support updateCipherSession"));
     }
 
-    Sailfish::Crypto::Result GostCryptoPlugin::finalizeCipherSession(
+    Result GostCryptoPlugin::finalizeCipherSession(
         quint64 clientId,
         const QByteArray &data,
         const QVariantMap &customParameters,
         quint32 cipherSessionToken,
         QByteArray *generatedData,
-        Sailfish::Crypto::CryptoManager::VerificationStatus *verificationStatus)
+        CryptoManager::VerificationStatus *verificationStatus)
     {
         Q_UNUSED(clientId);
         Q_UNUSED(data);

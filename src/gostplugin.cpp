@@ -394,14 +394,13 @@ namespace Plugins {
         }
 
         Result VerifySignature(
-            const QByteArray& ,
+            const QByteArray& publicKey,
             const QByteArray& data,
             const QByteArray& signature)
         {
-            const QByteArray wrongKey('a', OPENSSL_HELPER_GOST_SIGNATURE_PUBLIC_KEY_SIZE);
             const int rc = openssl_helper_verify_256(
-                wrongKey.data(),
-                wrongKey.size(),
+                publicKey.data(),
+                publicKey.size(),
 
                 data.data(),
                 data.size(),
@@ -676,9 +675,6 @@ namespace Plugins {
                 Result::OperationNotSupportedError,
                 QLatin1String("Gost error! Calculated digest is empty"));
         }
-
-        qDebug() << "digest.size() = " << digest.size();
-        qDebug() << "digest = " << digest;
 
         return CalculateSignature(key.privateKey(), digest, *signature);
     }
